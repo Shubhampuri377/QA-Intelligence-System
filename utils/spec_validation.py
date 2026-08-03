@@ -22,8 +22,9 @@ import concurrent.futures as cf
 
 from utils.json_utils import safe_json
 from utils.llm_client import classify_api_error
-from utils.field_compare import (MATCH, MISMATCH, GAP, REVIEW, norm, _norm_map,
-                                 _best_span, _snippet, _tokens, _best_line, NOT_PRESENT)
+from utils.field_compare import (MATCH, MISMATCH, GAP, REVIEW, NOT_VERIFIABLE, norm, _norm_map,
+                                 _best_span, _snippet, _tokens, _best_line, NOT_PRESENT,
+                                 _to_number, _parse_date, _NUM_TOKEN)
 from utils.json_utils import safe_json_object
 from utils.mapping_spec import (ABSENT, plan_letters, slots_for_letter, eval_expected,
                                 slot_checks)
@@ -96,20 +97,115 @@ def _truncation_probe(expected: str, out: str):
     return {"kept": cut, "total": len(n_exp), "snippet": _snippet(out, rs, re_)}
 
 
-def _shape_probe(expected: str, out: str, fmt: str):
-    """A competing value of the same shape as the expected one — the actual text
-    for a wrong-value defect."""
+def _label_span(out: str, slot_name: str):
+    """Where this field's own label appears in the output, if it does.
+
+    A same-shape probe with no anchor will always find something: asked for a due
+    date it returned the transaction date, then the invoice date. Both belong to
+    other fields. Humans do not read a document that way — they find the label and
+    read what sits next to it. Matching the label first is what makes a claim of
+    "found X" attributable to THIS field instead of merely shape-compatible.
+    """
+    words = [w for w in re.split(r"[^A-Za-z0-9]+", slot_name or "") if len(w) > 2]
+    if not words:
+        return None
+    low = out.lower()
+    best, best_hits = None, 0
+    for m in re.finditer(r"[A-Za-z][A-Za-z .#/&-]{2,40}", out):
+        seg = m.group().lower()
+        hits = sum(1 for w in words if w.lower() in seg)
+        if hits > best_hits:
+            best, best_hits = m, hits
+    if best is None or best_hits < max(1, len(words) - 1):
+        return None
+    return best.end()
+
+
+def _shape_probe(expected: str, out: str, fmt: str, others=(), slot_name: str = ""):
+    """A competing value of the same shape as the expected one, ATTRIBUTED to this
+    field — the actual text for a wrong-value defect.
+
+    `others` removes values that belong to other mapped fields. The label anchor
+    then requires the candidate to sit near this field's own label. If neither can
+    attribute a candidate, no value is quoted: the caller falls through to NOT
+    RENDERED, which is the honest answer, and the note still records that
+    same-shape values exist elsewhere on the page.
+    """
     rx = SHAPES.get((fmt or "").lower())
     if not rx:
         return None
     want = norm(expected)
+    taken = {norm(o) for o in others if o}
+    taken_dates = {d for d in (_parse_date(o) for o in others if o) if d}
+    taken_nums = {n for n in (_to_number(o) for o in others if o) if n is not None}
+
+    cands = []
     for m in rx.finditer(out):
-        if norm(m.group()) != want:
+        got = m.group()
+        if norm(got) == want or norm(got) in taken:
+            continue
+        gd, gn = _parse_date(got), _to_number(got)
+        if (gd and gd in taken_dates) or (gn is not None and gn in taken_nums):
+            continue
+        cands.append(m)
+    if not cands:
+        return None
+
+    anchor = _label_span(out, slot_name)
+    if anchor is not None:
+        near = [m for m in cands if 0 <= m.start() - anchor <= 60]
+        if near:
+            m = min(near, key=lambda x: x.start() - anchor)
             return {"found": m.group().strip(), "snippet": _snippet(out, m.start(), m.end())}
+
+    return {"unattributed": [m.group().strip() for m in cands[:3]]}
+
+
+_DATE_TOKEN = re.compile(r"\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b|\b\d{4}-\d{2}-\d{2}\b")
+
+
+def _equal_value_elsewhere(expected: str, out: str):
+    """Finds a token in the output that IS the expected value, written differently.
+
+    A date given as 07-21-2026 and printed as 07-21-26 is not missing — it is
+    reformatted. Reporting it as NOT RENDERED sends a tester hunting for a value
+    that is on the page in front of them. Still a failure under a no-loss rule
+    (the year was shortened), but the reason has to be accurate.
+    """
+    d_exp = _parse_date(expected)
+    if d_exp:
+        for m in _DATE_TOKEN.finditer(out):
+            if _parse_date(m.group()) == d_exp and norm(m.group()) != norm(expected):
+                return {"found": m.group().strip(), "why": "same date, shorter form",
+                        "snippet": _snippet(out, m.start(), m.end())}
+    n_exp = _to_number(expected)
+    if n_exp is not None:
+        for m in _NUM_TOKEN.finditer(out):
+            if _to_number(m.group()) == n_exp and norm(m.group()) != norm(expected):
+                return {"found": m.group().strip(), "why": "same amount, different formatting",
+                        "snippet": _snippet(out, m.start(), m.end())}
     return None
 
 
-def compare_slot(expected, out: str, slot: dict):
+def _is_label_leak(slot: dict) -> bool:
+    """True when a slot's expected value is just the BRD row's own label.
+
+    A BRD row reading `Footer | Template. Static.` names an element but never says
+    what text it holds. Read literally it becomes constant "Footer", and since no
+    document contains the word "Footer" it fails on every page — 18 of 40 findings
+    in one real run. The row is unanswerable from these inputs, so it is excluded
+    rather than reported. Kept as a rule here, not only in the prompt, because a
+    prompt cannot be relied on and the failure mode is silent and large.
+    """
+    exp = slot.get("expected") or {}
+    if exp.get("kind") != "constant":
+        return False
+    val = norm(str(exp.get("value", "")))
+    name = norm(str(slot.get("slot_name", "")))
+    return bool(val) and bool(name) and val == name
+
+
+def compare_slot(expected, out: str, slot: dict, others=()):
     """Compares one slot's expected value against a letter's text.
     Returns a verdict dict, or None to defer to AI."""
     exp_spec = slot.get("expected") or {}
@@ -129,7 +225,8 @@ def compare_slot(expected, out: str, slot: dict):
     if expected == "":
         return _res(MATCH, "No source value — nothing expected in the output.", "—")
     if not out.strip():
-        return _res(GAP, "No output text available for this letter.", NOT_PRESENT)
+        return _res(MISMATCH, "No output text available for this letter — nothing could "
+                              "be verified against it.", NOT_PRESENT)
 
     # 2. Rendered as expected (verbatim, case, or punctuation/spacing).
     for ci in (False, True):
@@ -144,25 +241,24 @@ def compare_slot(expected, out: str, slot: dict):
             return _res(MATCH, "Punctuation or spacing differs on render.",
                         _snippet(out, raw_idx[p], raw_idx[p + len(n_exp) - 1] + 1))
 
-    # 3. Multi-token values (addresses, names) are scored on TOKEN presence before
-    #    any truncation claim. A rendered "321 N 76TH STREET, OMAHA, NE 68114-3627"
-    #    is a standardised form of "321 N 76th St, Omaha, NE 68114", not a
-    #    truncation — but its normalised text does not match contiguously, so a
-    #    prefix probe run first would wrongly report it as cut short.
+    # 3. Multi-token values (addresses, names): every part of the source must be
+    #    present. Anything missing is a FAIL and the missing part is named, so the
+    #    tester can see at a glance whether it is a dropped line, a substituted
+    #    word or a shortened one. This layer deliberately makes NO judgement about
+    #    whether a difference is "acceptable" — that would mean encoding one
+    #    project's conventions, and the next project's would be different.
     toks = _tokens(expected)
     if len(toks) >= 2:
         missing = [t for t in toks if norm(t) not in n_out]
-        ratio = 1 - (len(missing) / len(toks))
         line, _ = _best_line(out, toks)
         if not missing:
-            return _res(MATCH, "Rendered with formatting differences.",
+            return _res(MATCH, "Rendered in full; formatting differs.",
                         line or "Rendered in output")
-        if ratio >= 0.5:
-            # Most of the value is there but part of it is not — name the missing
-            # piece rather than guessing whether it is a defect or a standardisation.
-            return _res(REVIEW,
-                        f"Rendered, but {len(missing)} of {len(toks)} part(s) not found: "
-                        f"{', '.join(missing[:4])}. Expected \"{expected[:70]}\".",
+        rendered = len(toks) - len(missing)
+        if rendered:
+            return _res(MISMATCH,
+                        f"Rendered INCOMPLETE — {rendered} of {len(toks)} part(s) present, "
+                        f"missing: {', '.join(missing[:6])}. Expected \"{expected[:70]}\".",
                         line or "Rendered in output")
 
     # 4. Truncated — a long leading chunk is rendered and the rest is absent.
@@ -173,17 +269,33 @@ def compare_slot(expected, out: str, slot: dict):
                     f"appear. Expected \"{expected[:70]}\".", tr["snippet"])
 
     # 5. Wrong value — something of the same shape is rendered instead.
-    sh = _shape_probe(expected, out, fmt)
-    if sh:
+    sh = _shape_probe(expected, out, fmt, others, slot.get("slot_name", ""))
+    if sh and sh.get("found"):
         return _res(MISMATCH,
                     f"Rendered value does not reconcile — expected \"{expected}\", "
                     f"found \"{sh['found']}\".", sh["snippet"])
+    unattributed = (sh or {}).get("unattributed") or []
 
-    if len(toks) >= 2:
-        return _res(GAP, "Expected value does not appear anywhere in this letter.", NOT_PRESENT)
+    # 6. Same value, different formatting. Still a FAIL — the source value did not
+    #    render as given — but saying NOT RENDERED about a date that is plainly on
+    #    the page, in a shorter form, is simply false, and a tester triaging fifty
+    #    rows needs to see the difference between "absent" and "reformatted".
+    eq = _equal_value_elsewhere(expected, out)
+    if eq:
+        return _res(MISMATCH,
+                    f"Rendered in a DIFFERENT FORMAT — expected \"{expected}\", "
+                    f"found \"{eq['found']}\" ({eq['why']}).", eq["snippet"])
 
-    if len(n_exp) >= 5:
-        return _res(GAP, "Expected value does not appear anywhere in this letter.", NOT_PRESENT)
+    # 7. Nothing of the source reached the output. A mapped field that does not
+    #    render is a failure, not a softer "gap" — the BRD said it must print.
+    if len(toks) >= 2 or len(n_exp) >= 5:
+        extra = ""
+        if unattributed:
+            extra = (" Other value(s) of the same shape appear elsewhere on the page ("
+                     + ", ".join(unattributed) + ") but none next to this field's label; "
+                     "check the label position by eye.")
+        return _res(MISMATCH, "NOT RENDERED — the expected value does not appear anywhere "
+                              f"in this letter. Expected \"{expected[:70]}\".{extra}", NOT_PRESENT)
     return None
 
 
@@ -192,27 +304,73 @@ def compare_slot(expected, out: str, slot: dict):
 def pair_letters_to_pages(planned: list, pages: list) -> None:
     """Assigns each planned letter its own output page.
 
-    Pairing on the letter's own addressee name is what keeps the control letter
-    and the Payor letter separate — validating them as one merged blob is how
-    a payor field could previously 'match' text belonging to the owner letter."""
+    Scored on HOW MANY of the letter's expected values appear on a page, not on one
+    anchor being perfect. The single-anchor version picked whatever looked most
+    distinctive in the addressee block — on a Suburban Propane run that was the
+    bill-to address, which is exactly the field the composition renders wrong
+    ("Amphitheatre" as "AMPHITEATER", country dropped). It matched nothing, all 2
+    letters failed to pair, and 44 fields came back "no output text available".
+    A tool whose job is to find defective values must not depend on a value being
+    correct in order to find the page at all.
+
+    Declared anchors and the addressee name still count triple, so an explicit
+    anchor wins ties; the remaining evidence is every other expected value.
+
+    Scaling: pages are normalised once and indexed by token, so candidate pages are
+    looked up rather than scanned. Cost grows with the feed, not with its square.
+    """
+    n_pages = [norm(p) for p in pages]
+    index = {}
+    for pi, np_text in enumerate(n_pages):
+        for tok in set(re.findall(r"[a-z0-9]+", np_text)):
+            index.setdefault(tok, set()).add(pi)
+
+    def pages_for(value: str):
+        """Pages containing every token of `value` — a cheap candidate filter."""
+        toks = re.findall(r"[a-z0-9]+", value)
+        if not toks:
+            return set()
+        hit = None
+        for t in toks:
+            pset = index.get(t)
+            if not pset:
+                return set()
+            hit = set(pset) if hit is None else (hit & pset)
+            if not hit:
+                return set()
+        return hit or set()
+
     used = set()
     for L in planned:
-        anchors = [a for a in [L.get("addressee_name"), L.get("policy_anchor")] if a]
+        strong = [norm(a) for a in (list(L.get("anchor_values") or [])
+                                    + [L.get("addressee_name"), L.get("policy_anchor")]) if a]
+        strong = [a for a in strong if a]
+        weak = [n for n in (norm(v) for v in (L.get("match_values") or [])) if len(n) >= 4]
+
+        cands = set()
+        for v in strong + weak:
+            cands |= pages_for(v)
+        if not cands:
+            cands = set(range(len(pages)))
+
         best, best_score = None, 0
-        for pi, ptext in enumerate(pages):
+        for pi in sorted(cands):
             if pi in used:
                 continue
-            np = norm(ptext)
-            score = sum(2 if norm(a) and norm(a) in np else 0 for a in anchors)
+            np_text = n_pages[pi]
+            score = (3 * sum(1 for a in strong if a in np_text)
+                     + sum(1 for v in weak if v in np_text))
             if score > best_score:
                 best, best_score = pi, score
         if best is not None and best_score > 0:
             used.add(best)
             L["page_index"] = best
             L["output_text"] = pages[best]
+            L["pair_score"] = best_score
         else:
             L["page_index"] = None
             L["output_text"] = ""
+            L["pair_score"] = 0
 
 
 def _ai_batch(bi, batch, out_text, rules, client, dbg):
@@ -229,7 +387,7 @@ def _ai_batch(bi, batch, out_text, rules, client, dbg):
             if isinstance(r, dict):
                 st = str(r.get("Status", "")).strip().upper()
                 by[r.get("Field_Path")] = {
-                    "status": st if st in (MATCH, MISMATCH, GAP, REVIEW) else REVIEW,
+                    "status": st if st in (MATCH, MISMATCH, NOT_VERIFIABLE) else MISMATCH,
                     "notes": str(r.get("Notes", "") or ""),
                     "output": str(r.get("Output_Value", "") or "")[:160], "by": "AI"}
         return by, {"input": result["input_tokens"], "output": result["output_tokens"],
@@ -254,6 +412,24 @@ def run_spec_validation(spec: dict, records: list, pages: list, rules: str,
 
     active = [L for L in planned_all if not L.get("skipped")]
     suppressed = [L for L in planned_all if L.get("skipped")]
+
+    # Every value this letter should contain, computed before pairing because it
+    # depends only on the record. Used both as pairing evidence and, later, to stop
+    # a probe offering one field's value as evidence about another.
+    letter_expected = {}
+    for L in active:
+        vals = []
+        for slot in slots_for_letter(spec, L["id"]):
+            try:
+                for chk in slot_checks(slot, L["record"], L, spec):
+                    v = str(chk.get("expected") or "").strip()
+                    if v and v != ABSENT:
+                        vals.append(v)
+            except Exception:
+                pass
+        letter_expected[L["id"]] = tuple(vals)
+        L["match_values"] = vals
+
     pair_letters_to_pages(active, pages)
     located = sum(1 for L in active if L.get("page_index") is not None)
     dbg.add("ok", "LETTER-PLAN",
@@ -266,15 +442,40 @@ def run_spec_validation(spec: dict, records: list, pages: list, rules: str,
     for L in active:
         rows = []
         for slot in slots_for_letter(spec, L["id"]):
+            if _is_label_leak(slot):
+                rows.append((slot, {"label": slot.get("slot_name", ""), "expected": "",
+                                    "why": "", "kind": "single"},
+                             _res(NOT_VERIFIABLE,
+                                  f"The BRD row \"{slot.get('slot_name', '')}\" names no text and no "
+                                  f"data field, so there is nothing to verify. Its own label was read "
+                                  f"as the expected value; that has been rejected.",
+                                  "Not verifiable", "Out of scope"), True))
+                continue
             if not slot.get("verifiable", True):
                 rows.append((slot, {"label": slot.get("slot_name", ""), "expected": "",
                                     "why": "", "kind": "single"},
-                             _res(REVIEW,
+                             _res(NOT_VERIFIABLE,
                                   slot.get("not_verifiable_reason", "Not verifiable from these inputs."),
                                   "Not verifiable", "Out of scope"), True))
                 continue
             for chk in slot_checks(slot, L["record"], L, spec):
-                res = compare_slot(chk["expected"], L.get("output_text", ""), slot)
+                miss = chk.get("unresolved") or []
+                if miss and not str(chk.get("expected") or "").strip():
+                    # The mapping names fields this feed does not contain. Nothing
+                    # can be compared, and calling it a pass would be a lie about
+                    # coverage — the mapping and the data disagree, which is the
+                    # finding worth reporting.
+                    rows.append((slot, chk,
+                                 _res(NOT_VERIFIABLE,
+                                      "NOT CHECKED — the mapping names "
+                                      + ", ".join(miss[:4])
+                                      + (" and others" if len(miss) > 4 else "")
+                                      + ", which do not exist in this source record. "
+                                        "Fix the mapping or the feed before trusting coverage.",
+                                      "No source field", "Out of scope"), True))
+                    continue
+                res = compare_slot(chk["expected"], L.get("output_text", ""), slot,
+                                   others=letter_expected.get(L["id"], ()))
                 rows.append((slot, chk, res, False))
                 if res is None:
                     unresolved.append((L, slot, chk))
@@ -321,7 +522,11 @@ def run_spec_validation(spec: dict, records: list, pages: list, rules: str,
             r = res or got.get(key)
             unv = res is None and key not in got and not out_of_scope
             if r is None:
-                r = _res(REVIEW, "AI comparison unavailable for this slot — needs a manual check.",
+                # A tool failure, not a verdict. It must not count as a pass, and it
+                # must not be asserted as a defect either — it is excluded from the
+                # pass rate and the run is marked INCOMPLETE by the unverified flag.
+                r = _res(NOT_VERIFIABLE, "AI comparison unavailable for this slot — "
+                                         "NOT CHECKED, needs a manual review.",
                          "Could not be determined", "AI")
             unverified += bool(unv)
             out_rows.append({

@@ -13,7 +13,9 @@ from utils.mapping_agents import build_findings, run_summary_agent
 from utils.spec_validation import run_mapping_spec_agent, run_spec_validation
 from utils.mapping_spec import spec_summary
 
-from utils.mapping_report import mapping_report_to_pdf, mapping_report_to_html, _rollup
+from utils.mapping_report import (mapping_report_to_pdf, mapping_report_to_html,
+                                  _rollup, _norm_status, DETAIL_ALL, DETAIL_FAILURES)
+from utils.mapping_excel import mapping_detail_to_excel
 from utils.naming import safe_filename_part
 
 AGENT_DEFS = [
@@ -42,6 +44,7 @@ for k, v in {
     "qa_meta": None, "qa_agent_status": None,
     "token_usage_qa": {"input": 0, "output": 0, "total": 0},
     "last_debug_qa": None, "qa_html_report": None, "qa_pdf_report": None,
+    "qa_excel_report": None, "qa_report_scope_built": None,
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -278,7 +281,8 @@ if run_validation:
     findings = build_findings(instances)
     meta_for_summary = {"source_file": data_file.name, "output_file": output_file.name,
                         "record_count": stats["records"]}
-    summary, s_usage = run_summary_agent(meta_for_summary, instances, findings, client, dbg)
+    summary, s_usage = run_summary_agent(meta_for_summary, instances, findings, client, dbg,
+                                            stats)
     for k in usage_total:
         usage_total[k] += s_usage[k]
     statuses["findings"] = "done"; refresh()
@@ -304,6 +308,7 @@ if run_validation:
     st.session_state.qa_agent_status = statuses
     st.session_state.qa_html_report = None
     st.session_state.qa_pdf_report = None
+    st.session_state.qa_excel_report = None
     st.session_state.last_debug_qa = dbg
     st.rerun()
 
@@ -325,11 +330,11 @@ if has_results:
 
     st.markdown('<div class="section-label">Executive Summary</div>', unsafe_allow_html=True)
     stats_row([
-        ("sb-purple", str(roll["fields"]), "Mapped Fields", "sv-purple"),
-        ("sb-green", str(roll["MATCH"]), "Match", "sv-green"),
-        ("sb-red", str(roll["MISMATCH"]), "Mismatch", "sv-red"),
-        ("sb-amber", str(roll["GAP"]), "Gap", "sv-amber"),
-        ("sb-blue", str(roll["REVIEW"]), "Review", "sv-blue"),
+        ("sb-purple", str(roll["checked"]), "Fields Checked", "sv-purple"),
+        ("sb-green", str(roll["PASS"]), "Pass", "sv-green"),
+        ("sb-red", str(roll["FAIL"]), "FAIL", "sv-red"),
+        ("sb-purple", f"{roll['pass_rate']:.1f}%", "Pass Rate", "sv-purple"),
+        ("sb-blue", str(roll["NOT VERIFIABLE"]), "Not Verifiable (excluded)", "sv-blue"),
     ])
     stats_row([
         ("sb-purple", f"{stats['instances_located']}/{stats.get('letters_expected', stats['records'])}", "Letters Paired", "sv-purple"),
@@ -351,12 +356,17 @@ if has_results:
     if summary.get("narrative"):
         st.markdown(f'<div class="vc-text" style="margin-bottom:10px;">{summary["narrative"]}</div>',
                     unsafe_allow_html=True)
-    if roll["MISMATCH"]:
-        st.error(f"{roll['MISMATCH']} field(s) do not reconcile with the source — review before sign-off.")
+    if roll["FAIL"]:
+        st.error(f"**VALIDATION FAILED** — {roll['FAIL']} of {roll['checked']} checked field(s) do "
+                 f"not render their source value in full. Every one is listed below with what is "
+                 f"missing.")
+    elif roll["checked"]:
+        st.success(f"**VALIDATION PASSED** — all {roll['checked']} checked field(s) render their "
+                   f"source value in full.")
 
     if findings:
         st.markdown('<div class="section-label">Key Findings At A Glance</div>', unsafe_allow_html=True)
-        cls = {"Mismatch": "rc-critical", "Gap": "", "Observation": "rc-info"}
+        cls = {"Failure": "rc-critical", "Not verifiable": "rc-info"}
         for f in findings:
             st.markdown(f"""<div class="reviewer-card {cls.get(f.get('type'), '')}">
               <div class="reviewer-title">{f.get('type', '')}</div>
@@ -384,17 +394,40 @@ if has_results:
                                 unsafe_allow_html=True)
 
     st.markdown('<div class="section-label">Field Mapping Detail</div>', unsafe_allow_html=True)
-    status_filter = st.multiselect("Filter by status", ["MATCH", "MISMATCH", "GAP", "REVIEW"],
-                                    default=["MISMATCH", "GAP", "REVIEW"], key="qa_status_filter")
+    fc1, fc2 = st.columns([3, 2])
+    with fc1:
+        status_filter = st.multiselect("Filter by status", ["PASS", "FAIL", "NOT VERIFIABLE"],
+                                        default=["FAIL"], key="qa_status_filter")
+    with fc2:
+        show_all_docs = st.toggle("Show every document", value=False, key="qa_show_all_docs",
+                                   help="Off: documents containing a failure are listed first and "
+                                        "the list is capped, so a 500-record run stays usable in "
+                                        "the browser. The downloads always contain everything.")
 
-    for inst in instances:
-        rows = [r for r in inst["rows"] if not status_filter or r["status"] in status_filter]
-        c = {"MATCH": 0, "MISMATCH": 0, "GAP": 0, "REVIEW": 0}
+    # A run can produce hundreds of documents; one expander with a table each is
+    # what makes the page crawl, not the validation. Failures first, then a cap —
+    # and the cap is stated, because a silently shortened list reads as a complete one.
+    DOC_CAP = 25
+    ordered = sorted(instances,
+                     key=lambda i: -sum(1 for r in i["rows"] if _norm_status(r["status"]) == "FAIL"))
+    shown = ordered if show_all_docs else ordered[:DOC_CAP]
+    if len(shown) < len(ordered):
+        hidden = len(ordered) - len(shown)
+        clean = sum(1 for i in ordered[DOC_CAP:]
+                    if not any(_norm_status(r["status"]) == "FAIL" for r in i["rows"]))
+        st.caption(f"Showing {len(shown)} of {len(ordered)} documents, those with failures first. "
+                   f"{hidden} not shown ({clean} of them passed every checked field) — "
+                   f"turn on **Show every document**, or use the Excel export for the full list.")
+
+    for inst in shown:
+        rows = [r for r in inst["rows"]
+                if not status_filter or _norm_status(r["status"]) in status_filter]
+        c = {"PASS": 0, "FAIL": 0, "NOT VERIFIABLE": 0}
         for r in inst["rows"]:
-            c[r["status"]] += 1
-        head = (f"{inst['title']}  —  {c['MATCH']} match · {c['MISMATCH']} mismatch · "
-                f"{c['GAP']} gap · {c['REVIEW']} review")
-        with st.expander(head, expanded=bool(c["MISMATCH"] or c["GAP"])):
+            c[_norm_status(r["status"])] += 1
+        head = (f"{inst['title']}  —  {c['PASS']} pass · {c['FAIL']} FAIL · "
+                f"{c['NOT VERIFIABLE']} not verifiable")
+        with st.expander(head, expanded=bool(c["FAIL"])):
             st.caption(inst["subtitle"])
             if not rows:
                 st.info("No fields match the selected status filter for this document.")
@@ -437,19 +470,38 @@ if has_results:
         "findings": findings,
         "instances": instances,
     }
+    # The full field-by-field PDF is ~1,100 pages at 500 records and 26 seconds to
+    # build. Failures-only keeps it a document someone will actually open, at any
+    # volume; the Excel export carries every row for the runs where that matters.
+    scope_label = st.radio(
+        "Report detail", ["Failures only (recommended)", "Every checked field"],
+        horizontal=True, key="qa_report_scope",
+        help="Applies to the PDF and HTML reports. Summary counts always cover the "
+             "whole run. The Excel export always contains every row.")
+    scope = DETAIL_FAILURES if scope_label.startswith("Failures") else DETAIL_ALL
+    if st.session_state.get("qa_report_scope_built") != scope:
+        st.session_state.qa_html_report = None
+        st.session_state.qa_pdf_report = None
+        st.session_state.qa_report_scope_built = scope
+
     if st.session_state.qa_html_report is None:
         try:
-            st.session_state.qa_html_report = mapping_report_to_html(payload)
+            st.session_state.qa_html_report = mapping_report_to_html(payload, detail=scope)
         except Exception as e:
             st.error(f"HTML export error: {e}")
     if st.session_state.qa_pdf_report is None:
         with st.spinner("Building PDF report…"):
             try:
-                st.session_state.qa_pdf_report = mapping_report_to_pdf(payload)
+                st.session_state.qa_pdf_report = mapping_report_to_pdf(payload, detail=scope)
             except Exception as e:
                 st.error(f"PDF export error: {e}")
+    if st.session_state.get("qa_excel_report") is None:
+        try:
+            st.session_state.qa_excel_report = mapping_detail_to_excel(payload)
+        except Exception as e:
+            st.error(f"Excel export error: {e}")
 
-    edc1, edc2, edc3 = st.columns(3)
+    edc1, edc2, edc3, edc4 = st.columns(4)
     with edc1:
         if st.session_state.qa_pdf_report:
             st.download_button("Download Report — PDF", data=st.session_state.qa_pdf_report,
@@ -461,9 +513,21 @@ if has_results:
                 file_name=f"{project_slug}_MappingValidationReport.html", mime="text/html",
                 use_container_width=True)
     with edc3:
+        if st.session_state.get("qa_excel_report"):
+            # No help= on this one: it wraps the button in a tooltip container the
+            # other three do not have, which makes it render and hover differently
+            # in a row that should look uniform. The explanation is a caption below.
+            st.download_button("Download Detail — Excel",
+                data=st.session_state.qa_excel_report,
+                file_name=f"{project_slug}_MappingValidationDetail.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True)
+    with edc4:
         st.download_button("Download Raw — JSON", data=json.dumps({
             "meta": meta, "stats": stats, "summary": summary,
             "findings": findings, "instances": instances,
         }, indent=2, default=str), file_name=f"{project_slug}_MappingValidationResults.json",
             mime="application/json", use_container_width=True)
+    st.caption("The Excel detail contains every checked field regardless of the report detail "
+               "setting above. The PDF and HTML follow that setting.")
     st.markdown('</div>', unsafe_allow_html=True)

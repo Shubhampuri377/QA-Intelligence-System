@@ -379,8 +379,30 @@ def _records_from_xml(file):
     children = list(root)
     if not children:
         return [_xml_to_dict(root)], "1 record parsed (root element)"
-    records = [_xml_to_dict(c) for c in children]
-    return records, f"{len(records)} record(s) parsed from XML — one per <{children[0].tag}> element"
+
+    # The record element is the one that REPEATS. Taking every root child made
+    # <File_Header> and <File_Trailer> into records alongside the real invoices —
+    # a 2-invoice feed reported as 4 records, with two of them carrying no
+    # document fields at all and every verdict against them meaningless.
+    # Non-repeating siblings are file-level metadata, so they are excluded and
+    # named in the note rather than dropped silently.
+    counts = {}
+    for c in children:
+        counts[c.tag] = counts.get(c.tag, 0) + 1
+    repeating = [t for t, n in counts.items() if n > 1]
+
+    if not repeating:
+        # Nothing repeats: the whole document describes one thing.
+        return [_xml_to_dict(root)], ("1 record parsed — no repeating element under "
+                                      f"<{root.tag}>, so the document is treated as a single record")
+
+    tag = max(repeating, key=lambda t: counts[t])
+    records = [_xml_to_dict(c) for c in children if c.tag == tag]
+    skipped = [t for t in counts if t != tag]
+    note = f"{len(records)} record(s) parsed from XML — one per <{tag}> element"
+    if skipped:
+        note += f"; treated as file-level metadata, not records: {', '.join('<' + t + '>' for t in skipped)}"
+    return records, note
 
 
 def _records_from_tabular(file):

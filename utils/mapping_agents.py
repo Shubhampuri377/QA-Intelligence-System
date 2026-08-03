@@ -270,13 +270,17 @@ def _output_hint(status: str) -> str:
 
 
 def build_findings(instances_payload: list, limit: int = 40) -> list:
-    """Turns every non-MATCH row into a Key Findings bullet, most severe first."""
-    order = {MISMATCH: 0, GAP: 1, REVIEW: 2}
-    label = {MISMATCH: "Mismatch", GAP: "Gap", REVIEW: "Observation"}
+    """Turns every failing row into a Key Findings bullet.
+
+    There is one severity now. A field that does not render its source value in
+    full is a failure, so the list is not ranked into softer tiers — sorting a
+    dropped address line below a wrong amount only invited someone to stop reading
+    partway down."""
+    from utils.mapping_report import _norm_status
     items = []
     for inst in instances_payload:
         for r in inst["rows"]:
-            if r["status"] == MATCH:
+            if _norm_status(r.get("status")) != "FAIL":
                 continue
             # Out-of-scope slots (logos, barcodes) are listed once in the
             # not-verifiable section — repeating them per letter buries the
@@ -285,8 +289,8 @@ def build_findings(instances_payload: list, limit: int = 40) -> list:
                 continue
             note = r.get("notes") or ""
             want = r.get("expected") or r.get("source")
-            items.append((order.get(r["status"], 3), {
-                "type": label.get(r["status"], "Observation"),
+            items.append((0, {
+                "type": "Failure",
                 "text": f"{r['field']} ({inst['title'].split('—')[0].strip()}) — "
                         f"expected \"{str(want)[:70]}\". {note}".strip(),
             }))
@@ -294,17 +298,21 @@ def build_findings(instances_payload: list, limit: int = 40) -> list:
     return [d for _, d in items[:limit]]
 
 
-def run_summary_agent(payload_meta: dict, instances_payload: list, findings: list, client, dbg):
+def run_summary_agent(payload_meta: dict, instances_payload: list, findings: list, client, dbg,
+                      stats: dict | None = None):
     """One small call for narrative + assessment + recommendations. Falls back to
     a deterministic summary if it fails — the report must still build."""
     from utils.mapping_report import _rollup
     roll = _rollup({"instances": instances_payload})
     unverified = sum(1 for inst in instances_payload for r in inst["rows"] if r.get("unverified"))
-    fallback = _fallback_summary(roll, unverified)
+    fallback = _fallback_summary(roll, unverified, stats or {})
 
     # If fields went unverified the run is incomplete, and no AI-written prose
     # may paper over that — the computed INCOMPLETE assessment stands.
-    if unverified or not findings:
+    # An incomplete run, or one where nothing paired, must keep its computed
+    # wording — there is no narrative worth generating about a run that did not
+    # compare anything.
+    if unverified or not findings or (stats or {}).get("instances_located") == 0:
         return fallback, new_zero_usage()
 
     prompt = MAPPING_SUMMARY_PROMPT.format(
@@ -312,8 +320,8 @@ def run_summary_agent(payload_meta: dict, instances_payload: list, findings: lis
         output_file=payload_meta.get("output_file", "—"),
         record_count=payload_meta.get("record_count", "—"),
         instance_count=len(instances_payload),
-        field_count=roll["fields"], matches=roll[MATCH], mismatches=roll[MISMATCH],
-        gaps=roll[GAP], reviews=roll[REVIEW],
+        field_count=roll["checked"], matches=roll["PASS"], mismatches=roll["FAIL"],
+        gaps=0, reviews=roll["NOT VERIFIABLE"],
         findings=json.dumps(findings[:30], indent=2),
     )
     dbg.add("info", "SUMMARY-AGENT", f"Summarising {len(findings)} finding(s)")
@@ -326,7 +334,10 @@ def run_summary_agent(payload_meta: dict, instances_payload: list, findings: lis
                  "total": result["total_tokens"]}
         out = {
             "narrative": str(obj.get("narrative") or fallback["narrative"]),
-            "assessment": str(obj.get("assessment") or fallback["assessment"]),
+            # The verdict is arithmetic, never prose. Left to the model it produced
+            # "PASS WITH FINDINGS" over a run containing a wrong premium amount and
+            # a wrong sales-rep name. One failing field fails the run.
+            "assessment": fallback["assessment"],
             "recommendations": [str(r) for r in (obj.get("recommendations") or [])
                                  if str(r).strip()] or fallback["recommendations"],
         }
@@ -339,46 +350,84 @@ def run_summary_agent(payload_meta: dict, instances_payload: list, findings: lis
         return fallback, new_zero_usage()
 
 
-def _fallback_summary(roll: dict, unverified: int = 0) -> dict:
-    """Computed summary, used when the AI summary is unavailable.
+def _fallback_summary(roll: dict, unverified: int = 0, stats: dict | None = None) -> dict:
+    """The computed verdict. Binary by design.
 
-    When fields went unverified the assessment must NOT begin with PASS. A run
-    where most fields were never actually checked is an incomplete run, and
-    saying "PASS WITH FINDINGS" over the top of it is the one outcome that
-    would make this report actively misleading."""
-    m, g, rv = roll[MISMATCH], roll[GAP], roll[REVIEW]
-    total = roll["fields"]
+    A mapped field either renders its source value in full or it does not. If any
+    field does not, the run FAILED — a half-rendered address is a defect whether it
+    is one field or fifty, and no percentage of passes offsets it. Rows the inputs
+    cannot answer are excluded from the rate and reported separately, never as
+    passes.
+    """
+    f, p, nv = roll["FAIL"], roll["PASS"], roll["NOT VERIFIABLE"]
+    checked, rate = roll["checked"], roll["pass_rate"]
+    stats = stats or {}
+
+    # If no record could be paired to an output page, nothing was compared against
+    # anything. Reporting a pass rate then is worse than useless: one real run
+    # printed "97.3% pass" with 0 of 4 instances located, because a field whose
+    # expected value was empty counted as a pass without an output to check.
+    located = stats.get("instances_located")
+    expected_docs = stats.get("letters_expected")
+    if located == 0 and expected_docs:
+        return {
+            "narrative": (f"No comparison was performed. {expected_docs} document(s) were expected "
+                          f"from the source feed, but none could be matched to a page in the output "
+                          f"file, so no field had an output value to be checked against."),
+            "assessment": ("INCOMPLETE — 0 of "
+                           f"{expected_docs} expected document(s) could be matched to a page in the "
+                           f"output. No field was actually compared, so this run carries no verdict. "
+                           f"Check that the output file corresponds to this source feed, and that "
+                           f"the record grain is right — a feed split into the wrong records cannot "
+                           f"pair to anything."),
+            "recommendations": [
+                "Confirm the output PDF was generated from this exact source feed.",
+                "Check the record count in the debug log against the feed's own trailer count — if "
+                "they disagree, the feed is being split at the wrong level.",
+                "Review the Mapping Spec: if its addressee block cannot be resolved, there is no "
+                "anchor value to pair a record to a page.",
+            ],
+        }
 
     if unverified:
+        total = roll["fields"]
         pct = round(unverified / total * 100) if total else 0
-        assessment = (f"INCOMPLETE — {unverified} of {total} field(s) ({pct}%) were never verified "
-                      f"because their AI comparison call failed. Do not sign off on this run; "
-                      f"re-run with fewer parallel requests or a provider that is not rate-limited.")
-        narrative = (f"This run did not complete. Of {total} mapped field(s), {total - unverified} "
-                     f"were compared and {unverified} were left unverified after their AI "
-                     f"comparison call failed. Within the {total - unverified} that were checked: "
-                     f"{roll[MATCH]} matched, {m} did not reconcile, {g} were present in the source "
-                     f"but not rendered. Counts below exclude nothing — unverified fields are listed "
-                     f"with their status shown as provisional.")
-        recs = ["Re-run this validation before drawing any conclusion — the majority of fields "
-                "carry no verdict.",
+        return {
+            "narrative": (f"This run did not complete. Of {total} mapped field(s), "
+                          f"{total - unverified} were compared and {unverified} were left "
+                          f"unverified after their AI comparison call failed. Within those "
+                          f"checked: {p} passed, {f} failed."),
+            "assessment": (f"INCOMPLETE — {unverified} of {total} field(s) ({pct}%) were never "
+                           f"verified because their AI comparison call failed. Do not sign off; "
+                           f"re-run with fewer parallel requests or a provider that is not "
+                           f"rate-limited."),
+            "recommendations": [
+                "Re-run this validation before drawing any conclusion — some fields carry no verdict.",
                 "Lower Parallel requests in Advanced options, or switch to a provider without a "
-                "free-tier daily cap, to avoid the rate limit that caused the failures."]
-        return {"narrative": narrative, "assessment": assessment, "recommendations": recs}
+                "free-tier daily cap, to avoid the rate limit that caused the failures."],
+        }
 
-    if m == 0 and g == 0:
-        assessment = "PASS — every mapped field reconciles between the source feed and the output."
-    elif m == 0:
-        assessment = (f"PASS WITH FINDINGS — no contradicting values, but {g} source field(s) "
-                      f"are not rendered in the output.")
+    if f:
+        assessment = (f"FAIL — {f} of {checked} checked field(s) do not render their source value "
+                      f"in full. Pass rate {rate:.1f}%. Every failure is listed below with the "
+                      f"source value, what rendered, and what is missing.")
+        narrative = (f"{checked} mapped field(s) were reconciled between the source feed and the "
+                     f"generated output. {p} rendered the source value in full; {f} did not — "
+                     f"missing, incomplete, or a different value. "
+                     + (f"{nv} field(s) could not be verified from these inputs and are excluded "
+                        f"from the rate." if nv else ""))
     else:
-        assessment = (f"PASS WITH FINDINGS — {m} field(s) do not reconcile and {g} are not "
-                      f"rendered; review before sign-off.")
+        assessment = (f"PASS — all {checked} checked field(s) render their source value in full."
+                      + (f" {nv} field(s) could not be verified from these inputs and are listed "
+                         f"separately." if nv else ""))
+        narrative = (f"{checked} mapped field(s) were reconciled between the source feed and the "
+                     f"generated output and all of them rendered in full. "
+                     + (f"{nv} field(s) are not verifiable from these inputs — the BRD names no "
+                        f"text or data field for them, or they are not text — and are excluded "
+                        f"from the pass rate." if nv else ""))
     return {
-        "narrative": (f"{total} mapped field(s) were reconciled between the source feed "
-                      f"and the generated output. {roll[MATCH]} matched, {m} did not reconcile, "
-                      f"{g} were present in the source but not rendered, and {rv} need a manual look."),
+        "narrative": narrative,
         "assessment": assessment,
-        "recommendations": ["Review each Mismatch and Gap in the detail tables below with the "
+        "recommendations": ["Review each FAIL in the detail tables below with the "
                             "mapping owner to confirm whether it is a defect or an intended rule."],
     }

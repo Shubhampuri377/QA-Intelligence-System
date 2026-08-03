@@ -30,23 +30,32 @@ GRAY = "#5B6370"
 LIGHT_BG = "#F2F3F5"
 BORDER = "#B9C0CB"
 
-STATUS_FG = {"MATCH": "#15803D", "MISMATCH": "#B42318", "GAP": "#B54708", "REVIEW": "#3748A6"}
-STATUS_BG = {"MATCH": "#EAF7EE", "MISMATCH": "#FBEAEA", "GAP": "#FEF6E7", "REVIEW": "#EEF1F6"}
+# PASS / FAIL / NOT VERIFIABLE. GAP and REVIEW are retained only so an older
+# saved result still renders; nothing emits them any more.
+STATUS_FG = {"PASS": "#15803D", "FAIL": "#B42318", "NOT VERIFIABLE": "#5B6370",
+             "MATCH": "#15803D", "MISMATCH": "#B42318", "GAP": "#B42318", "REVIEW": "#5B6370"}
+STATUS_BG = {"PASS": "#EAF7EE", "FAIL": "#FBEAEA", "NOT VERIFIABLE": "#F2F3F5",
+             "MATCH": "#EAF7EE", "MISMATCH": "#FBEAEA", "GAP": "#FBEAEA", "REVIEW": "#F2F3F5"}
 
-FINDING_FG = {"Mismatch": "#B42318", "Gap": "#B54708", "Observation": "#3748A6"}
+FINDING_FG = {"Failure": "#B42318", "Mismatch": "#B42318", "Gap": "#B42318",
+              "Not verifiable": "#5B6370", "Observation": "#5B6370"}
 
 
 def _norm_status(s: str) -> str:
+    """Collapses every verdict to PASS / FAIL / NOT VERIFIABLE.
+
+    A mapped field either renders its source value in full or it does not. The old
+    GAP and REVIEW buckets sat between those two and let a genuine defect — a name
+    rendered half, an address line dropped — read as something softer than a
+    failure. Anything that is not a clean render is now a FAIL; the reason still
+    distinguishes NOT RENDERED from TRUNCATED from a wrong value.
+    """
     s = (s or "").strip().upper()
-    if s.startswith("MATCH"):
-        return "MATCH"
-    if s.startswith("MISMATCH"):
-        return "MISMATCH"
-    if s.startswith("GAP"):
-        return "GAP"
-    if s.startswith("REVIEW"):
-        return "REVIEW"
-    return "REVIEW"
+    if s.startswith("MATCH") or s.startswith("PASS"):
+        return "PASS"
+    if s.startswith("NOT VERIFIABLE") or s.startswith("OUT OF SCOPE"):
+        return "NOT VERIFIABLE"
+    return "FAIL"
 
 
 def _clip(v, n=300) -> str:
@@ -60,14 +69,94 @@ def _esc_pdf(v, n=300) -> str:
 
 
 def _instance_counts(inst: dict) -> dict:
-    c = {"MATCH": 0, "MISMATCH": 0, "GAP": 0, "REVIEW": 0}
+    c = {"PASS": 0, "FAIL": 0, "NOT VERIFIABLE": 0}
     for r in inst.get("rows", []) or []:
         c[_norm_status(r.get("status"))] += 1
     return c
 
 
+# A full field-by-field PDF is ~1,100 pages at 500 records and 26 seconds to
+# build; at 2,000 it is ~4,400 pages. Nobody opens that, and the passing rows are
+# the bulk of it. So the DETAIL tables default to failures only while the summary
+# counts keep covering every row — the report must never look smaller than the run
+# actually was.
+DETAIL_ALL = "all"
+DETAIL_FAILURES = "failures"
+PDF_ROW_CAP = 4000
+
+
+def _detail_instances(payload: dict, detail: str, row_cap: int | None = None):
+    """Returns (instances_to_render, omitted_note).
+
+    Instances with nothing to show are dropped and counted in the note rather than
+    printed as empty sections. Any cap is disclosed in the same note — a report that
+    silently stops listing rows reads as if there were no more.
+    """
+    all_inst = payload.get("instances", []) or []
+    if detail == DETAIL_ALL:
+        kept, dropped_inst, dropped_rows = list(all_inst), 0, 0
+    else:
+        kept, dropped_inst, dropped_rows = [], 0, 0
+        for inst in all_inst:
+            rows = [r for r in (inst.get("rows") or [])
+                    if _norm_status(r.get("status")) != "PASS" or r.get("unverified")]
+            if rows:
+                kept.append({**inst, "rows": rows})
+                dropped_rows += len(inst.get("rows") or []) - len(rows)
+            else:
+                dropped_inst += 1
+                dropped_rows += len(inst.get("rows") or [])
+
+    capped = 0
+    if row_cap:
+        out, budget = [], row_cap
+        for inst in kept:
+            rows = inst.get("rows") or []
+            if budget <= 0:
+                capped += len(rows)
+                continue
+            if len(rows) > budget:
+                capped += len(rows) - budget
+                out.append({**inst, "rows": rows[:budget]})
+                budget = 0
+            else:
+                out.append(inst)
+                budget -= len(rows)
+        kept = out
+
+    bits = []
+    if detail != DETAIL_ALL and dropped_rows:
+        bits.append(f"{dropped_rows:,} passing row(s) are not listed below")
+        if dropped_inst:
+            bits.append(f"{dropped_inst:,} document(s) passed every checked field")
+    if capped:
+        bits.append(f"{capped:,} further row(s) were omitted at this report's size limit — "
+                    f"use the Excel export for the complete list")
+    note = ""
+    if bits:
+        note = ("Detail scope: " + "; ".join(bits)
+                + ". The counts above cover every row that was checked.")
+    return kept, note
+
+
+def _rate_text(roll: dict, stats: dict) -> str:
+    """The pass rate, or why there isn't one.
+
+    A run where no document paired to an output page printed "Pass rate 18.2%"
+    directly beside an INCOMPLETE assessment saying nothing had been compared. Both
+    came from the same data and only one was true. If nothing paired, there is no
+    rate to report.
+    """
+    stats = stats or {}
+    if stats.get("letters_expected") and stats.get("instances_located") == 0:
+        return "not computed — no document could be paired to an output page"
+    if not roll["checked"]:
+        return "not computed — no field was checked"
+    return f"{roll['pass_rate']:.1f}%"
+
+
 def _rollup(payload: dict) -> dict:
-    total = {"MATCH": 0, "MISMATCH": 0, "GAP": 0, "REVIEW": 0}
+    total = {"PASS": 0, "FAIL": 0, "NOT VERIFIABLE": 0}
     fields = 0
     for inst in payload.get("instances", []) or []:
         c = _instance_counts(inst)
@@ -75,6 +164,11 @@ def _rollup(payload: dict) -> dict:
             total[k] += c[k]
         fields += len(inst.get("rows", []) or [])
     total["fields"] = fields
+    # The pass rate is over what could actually be checked. Counting rows the
+    # inputs cannot answer would quietly depress a clean run, and counting them as
+    # passes would inflate a dirty one.
+    total["checked"] = total["PASS"] + total["FAIL"]
+    total["pass_rate"] = (total["PASS"] / total["checked"] * 100) if total["checked"] else 0.0
     return total
 
 
@@ -82,7 +176,7 @@ def _rollup(payload: dict) -> dict:
 # PDF
 # ═══════════════════════════════════════════════════════════════
 
-def mapping_report_to_pdf(payload: dict) -> bytes:
+def mapping_report_to_pdf(payload: dict, detail: str = DETAIL_FAILURES) -> bytes:
     buf = BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=1.7 * cm, bottomMargin=1.7 * cm,
                              leftMargin=1.6 * cm, rightMargin=1.6 * cm,
@@ -166,11 +260,11 @@ def mapping_report_to_pdf(payload: dict) -> bytes:
     metric_rows = [
         ["Records in source feed", str(totals.get("source_records", "—"))],
         ["Document instances located in output", str(totals.get("instances_matched", len(payload.get("instances", []))))],
-        ["Mapped fields validated", str(roll["fields"])],
-        ["Fields matching source → output", str(roll["MATCH"])],
-        ["Mismatches identified", str(roll["MISMATCH"])],
-        ["Gaps (in source, not rendered)", str(roll["GAP"])],
-        ["Flagged for review", str(roll["REVIEW"])],
+        ["Mapped fields checked", str(roll["checked"])],
+        ["Passed — source value rendered in full", str(roll["PASS"])],
+        ["FAILED — missing, incomplete or wrong", str(roll["FAIL"])],
+        ["Pass rate", _rate_text(roll, payload.get("stats"))],
+        ["Not verifiable from these inputs (excluded)", str(roll["NOT VERIFIABLE"])],
     ]
     if totals.get("deterministic") is not None:
         metric_rows.append(["Resolved without AI (rule-based)",
@@ -186,13 +280,13 @@ def mapping_report_to_pdf(payload: dict) -> bytes:
         ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
         ("LEFTPADDING", (0, 0), (-1, -1), 6),
     ]
-    if roll["MISMATCH"]:
+    if roll["FAIL"]:
         i = 4
-        m_style += [("TEXTCOLOR", (1, i), (1, i), colors.HexColor(STATUS_FG["MISMATCH"])),
+        m_style += [("TEXTCOLOR", (1, i), (1, i), colors.HexColor(STATUS_FG["FAIL"])),
                     ("FONTNAME", (1, i), (1, i), "Helvetica-Bold")]
-    if roll["GAP"]:
+    if False:
         i = 5
-        m_style += [("TEXTCOLOR", (1, i), (1, i), colors.HexColor(STATUS_FG["GAP"])),
+        m_style += [("TEXTCOLOR", (1, i), (1, i), colors.HexColor(STATUS_FG["FAIL"])),
                     ("FONTNAME", (1, i), (1, i), "Helvetica-Bold")]
     m_tbl.setStyle(TableStyle(m_style))
     story += [m_tbl]
@@ -210,6 +304,9 @@ def mapping_report_to_pdf(payload: dict) -> bytes:
 
     # ── Per-instance field tables ──
     story.append(Paragraph("Field Mapping Detail", h2))
+    detail_instances, detail_note = _detail_instances(payload, detail, PDF_ROW_CAP)
+    if detail_note:
+        story += [Paragraph(_esc_pdf(detail_note, 400), small_gray), Spacer(1, 6)]
     has_expected = any(r.get("expected") for inst in (payload.get("instances") or [])
                        for r in (inst.get("rows") or []))
     col_w = ([3.2 * cm, 3.9 * cm, 3.9 * cm, 1.9 * cm, 4.9 * cm] if has_expected
@@ -217,16 +314,16 @@ def mapping_report_to_pdf(payload: dict) -> bytes:
     src_header = "Expected Value" if has_expected else "Source Value"
     src_key = "expected" if has_expected else "source"
 
-    for inst in payload.get("instances", []) or []:
+    for inst in detail_instances:
         c = _instance_counts(inst)
         story.append(Paragraph(_esc_pdf(inst.get("title") or "Document instance", 300), h3))
         meta_bits = []
         if inst.get("subtitle"):
             meta_bits.append(_esc_pdf(inst["subtitle"], 200))
-        meta_bits.append(f'<font color="{STATUS_FG["MATCH"]}">{c["MATCH"]} match</font> · '
-                         f'<font color="{STATUS_FG["MISMATCH"]}">{c["MISMATCH"]} mismatch</font> · '
-                         f'<font color="{STATUS_FG["GAP"]}">{c["GAP"]} gap</font> · '
-                         f'<font color="{STATUS_FG["REVIEW"]}">{c["REVIEW"]} review</font>')
+        meta_bits.append(f'<font color="{STATUS_FG["PASS"]}">{c["PASS"]} pass</font> · '
+                         f'<font color="{STATUS_FG["FAIL"]}">{c["FAIL"]} FAIL</font> · '
+                         f'<font color="{STATUS_FG["NOT VERIFIABLE"]}">'
+                         f'{c["NOT VERIFIABLE"]} not verifiable</font>')
         story += [Paragraph(" &nbsp;|&nbsp; ".join(meta_bits), small_gray), Spacer(1, 4)]
 
         data = [[Paragraph("Mapped Field", th), Paragraph(src_header, th),
@@ -321,7 +418,7 @@ def _html_status_cell(r: dict) -> str:
     return f'<td class="stcell st-{st}">{st}</td>'
 
 
-def mapping_report_to_html(payload: dict) -> str:
+def mapping_report_to_html(payload: dict, detail: str = DETAIL_ALL) -> str:
     e = lambda v, n=400: html.escape(_clip(v, n))
     roll = _rollup(payload)
     totals = payload.get("totals") or {}
@@ -340,11 +437,12 @@ def mapping_report_to_html(payload: dict) -> str:
         ("Records in source feed", totals.get("source_records", "—"), None),
         ("Document instances located in output",
          totals.get("instances_matched", len(payload.get("instances", []))), None),
-        ("Mapped fields validated", roll["fields"], None),
-        ("Fields matching source → output", roll["MATCH"], "MATCH"),
-        ("Mismatches identified", roll["MISMATCH"], "MISMATCH" if roll["MISMATCH"] else None),
-        ("Gaps (in source, not rendered)", roll["GAP"], "GAP" if roll["GAP"] else None),
-        ("Flagged for review", roll["REVIEW"], "REVIEW" if roll["REVIEW"] else None),
+        ("Mapped fields checked", roll["checked"], None),
+        ("Passed — source value rendered in full", roll["PASS"], "PASS"),
+        ("FAILED — missing, incomplete or wrong", roll["FAIL"], "FAIL" if roll["FAIL"] else None),
+        ("Pass rate", _rate_text(roll, payload.get("stats")),
+         "FAIL" if roll["FAIL"] else "PASS"),
+        ("Not verifiable from these inputs (excluded)", roll["NOT VERIFIABLE"], None),
     ]
     if totals.get("deterministic") is not None:
         metrics.append(("Resolved without AI (rule-based)",
@@ -367,8 +465,9 @@ def mapping_report_to_html(payload: dict) -> str:
     src_header = "Expected Value" if has_expected else "Source Value"
     src_key = "expected" if has_expected else "source"
 
+    detail_instances, detail_note = _detail_instances(payload, detail)
     nav_items, inst_html = [], []
-    for idx, inst in enumerate(payload.get("instances", []) or [], start=1):
+    for idx, inst in enumerate(detail_instances, start=1):
         c = _instance_counts(inst)
         anchor = f"inst-{idx}"
         nav_items.append(f'<a href="#{anchor}">{e(inst.get("title") or f"Instance {idx}", 90)}</a>')
@@ -385,10 +484,9 @@ def mapping_report_to_html(payload: dict) -> str:
         <section id="{anchor}" class="inst">
           <h3>{e(inst.get("title") or f"Instance {idx}", 300)}</h3>
           <div class="imeta">{e(inst.get("subtitle") or "", 300)}
-            <span class="pill st-MATCH">{c['MATCH']} match</span>
-            <span class="pill st-MISMATCH">{c['MISMATCH']} mismatch</span>
-            <span class="pill st-GAP">{c['GAP']} gap</span>
-            <span class="pill st-REVIEW">{c['REVIEW']} review</span>
+            <span class="pill st-PASS">{c['PASS']} pass</span>
+            <span class="pill st-FAIL">{c['FAIL']} FAIL</span>
+                <span class="pill st-NV">{c['NOT VERIFIABLE']} not verifiable</span>
           </div>
           <div class="tblwrap"><table class="grid">
             <thead><tr><th>Mapped Field</th><th>{src_header}</th><th>Output Value</th>
@@ -453,7 +551,9 @@ def mapping_report_to_html(payload: dict) -> str:
   td.fld{{white-space:nowrap}}
   td.notes{{color:var(--gray);font-size:.76rem}}
   .stcell{{text-align:center;font-weight:800;font-size:.72rem;letter-spacing:.03em;white-space:nowrap}}
-  .st-MATCH{{background:{STATUS_BG['MATCH']}!important;color:{STATUS_FG['MATCH']}}}
+  .st-PASS,.st-MATCH{{background:{STATUS_BG['PASS']}!important;color:{STATUS_FG['PASS']}}}
+    .st-FAIL,.st-GAP{{background:{STATUS_BG['FAIL']}!important;color:{STATUS_FG['FAIL']}}}
+    .st-NV{{background:{STATUS_BG['NOT VERIFIABLE']}!important;color:{STATUS_FG['NOT VERIFIABLE']}}}
   .st-MISMATCH{{background:{STATUS_BG['MISMATCH']}!important;color:{STATUS_FG['MISMATCH']}}}
   .st-GAP{{background:{STATUS_BG['GAP']}!important;color:{STATUS_FG['GAP']}}}
   .st-REVIEW{{background:{STATUS_BG['REVIEW']}!important;color:{STATUS_FG['REVIEW']}}}
@@ -473,6 +573,7 @@ def mapping_report_to_html(payload: dict) -> str:
           border-radius:5px}}
   .nav{{margin:10px 0 4px;font-size:.8rem}}
   .nav a{{color:var(--navy);margin-right:14px;text-decoration:none;border-bottom:1px dotted}}
+  .dnote{{font-size:.78rem;color:var(--gray);font-style:italic;margin:-4px 0 10px}}
   footer{{text-align:center;color:var(--gray);font-size:.74rem;margin-top:26px;
          border-top:1px solid var(--border);padding-top:12px}}
   @media print{{body{{background:#fff;padding:0}}.page{{border:none;border-radius:0}}
@@ -488,6 +589,7 @@ def mapping_report_to_html(payload: dict) -> str:
   <table class="kv">{metrics_html}</table>
   {findings_html}
   <h2>Field Mapping Detail</h2>
+  {f'<div class="dnote">{e(detail_note, 400)}</div>' if detail_note else ""}
   <div class="nav">{"".join(nav_items)}</div>
   {"".join(inst_html)}
   {nv_html}

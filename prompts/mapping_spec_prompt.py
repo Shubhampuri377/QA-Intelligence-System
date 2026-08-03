@@ -88,8 +88,14 @@ two decimals. Use "none" when the BRD specifies no transformation.
 ---
 
 # RULES
-- Create a slot for EVERY row of the BRD's mapping table, including static template text
-  (letterhead, titles, labels, footers) — those are checkable and cheap.
+- Create a slot for EVERY row of the BRD's mapping table.
+- A static/template row is checkable ONLY IF the BRD gives the literal text that must print.
+  If it does, use {{"kind": "constant", "value": "<that exact text>"}}.
+  If the row says only "Static", "Template", or similar WITHOUT quoting the text — a row named
+  "Footer" whose requirement is just "Template. Static." — you do NOT know what should print.
+  Set "verifiable": false, reason "BRD names no text or data field for this element".
+  NEVER use the row's own label as the expected value. A row called "Footer" does not mean the
+  document contains the word "Footer"; asserting that produces a false failure on every page.
 - Set "verifiable": false with a "not_verifiable_reason" for anything that cannot be found in
   extracted document text: logos, barcodes/IMB, fonts, colours, paper stock.
 - Put requirements that are not document fields at all — print/paper/fold specs, acknowledgement

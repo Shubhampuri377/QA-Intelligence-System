@@ -25,6 +25,21 @@ from datetime import datetime
 
 MATCH, MISMATCH, GAP, REVIEW = "MATCH", "MISMATCH", "GAP", "REVIEW"
 
+# The verdict is binary: a mapped field either renders its source value in full
+# (PASS) or it does not (FAIL). "Partly rendered", "close enough" and
+# "standardised by some downstream process" are all FAIL — whether a difference is
+# acceptable is the tester's call to make from the evidence, not a call this tool
+# should quietly make on their behalf, and any leniency rule would have to encode
+# knowledge of one specific project.
+#
+# NOT_VERIFIABLE is the only third state, and it is not a soft pass: it means the
+# inputs cannot answer the question at all — the BRD names no text and no data
+# field for the element, or the element is not text (logo, barcode). These rows
+# are excluded from the pass rate and listed on their own so they can never be
+# mistaken for verified.
+NOT_VERIFIABLE = "NOT VERIFIABLE"
+FAIL_STATES = (MISMATCH, GAP, REVIEW)
+
 _DATE_IN = ["%m-%d-%Y", "%m/%d/%Y", "%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y",
             "%m-%d-%y", "%m/%d/%y", "%d/%m/%Y", "%Y%m%d", "%B %d, %Y", "%b %d, %Y"]
 # Only separator-bearing / word-bearing forms — a bare "07222026" would match

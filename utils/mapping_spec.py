@@ -106,7 +106,11 @@ def fmt_currency(v) -> str:
         n = float(s)
     except ValueError:
         return str(v or "").strip()
-    return f"${n:,.2f}"
+    # Sign OUTSIDE the symbol: -$201.00, not $-201.00. Documents print it the
+    # first way, so the wrong order made a correctly rendered credit fail to match
+    # and the fallback probe then quoted an unrelated "$0.00" from elsewhere on the
+    # page as the value found.
+    return f"-${abs(n):,.2f}" if n < 0 else f"${n:,.2f}"
 
 
 def apply_format(value: str, fmt: str) -> str:
@@ -180,6 +184,33 @@ def slot_is_present(slot: dict, record: dict, letter: dict) -> tuple:
     return True, ""
 
 
+def missing_paths(slot: dict, record: dict, letter: dict) -> list:
+    """The field paths this slot names that DO NOT EXIST in the source record.
+
+    A path that does not exist and a path holding an empty string both evaluate to
+    "" — and an empty expected value used to be reported as a pass ("no source
+    value, nothing expected"). On a mapping document that names fields the feed
+    does not contain, that produced 109 passes out of 112 without comparing
+    anything, and a 97.3% pass rate on a run where nothing had been checked.
+
+    They are not the same thing and must not share a verdict: an empty field
+    legitimately renders nothing, while a field the feed does not have means the
+    mapping and the data disagree — which is a finding about the spec, reported as
+    NOT VERIFIABLE so it can never read as a pass.
+    """
+    exp = slot.get("expected") or {}
+    if exp.get("kind") != "fields":
+        return []
+    fields = exp.get("fields") or []
+    if not fields:
+        return []
+    block, bpath = resolve_block(exp.get("block") or {"kind": "root"}, record, letter)
+    if not isinstance(block, dict):
+        return [f"{bpath or 'record'} (block not found)"]
+    return [f"{bpath}/{f}".replace("//", "/").lstrip("/")
+            for f in fields if get_path(block, f) is None]
+
+
 def eval_expected(slot: dict, record: dict, letter: dict) -> tuple:
     """Returns (expected_value_or_ABSENT, explanation)."""
     present, why = slot_is_present(slot, record, letter)
@@ -216,6 +247,34 @@ def eval_expected(slot: dict, record: dict, letter: dict) -> tuple:
 
 # ── letter planning ──────────────────────────────────────────────
 
+def _anchor_values(ldef: dict, record: dict, addressee_block, addressee_name: str) -> list:
+    """Values distinctive enough to match a record to its page in the output.
+
+    block_name() only knows firstName/middleName/lastName/nameSuffix, so a feed
+    that carries the customer as ONE field — <Customer_Name>Suraj Mahato</> — yields
+    no anchor at all, every record fails to pair, and the report then grades fields
+    against empty output text. Real run: 0 of 4 instances located, 97.3% "pass".
+
+    Order: paths the spec declares, then the assembled addressee name, then the
+    longest distinctive scalar in the addressee block. The last one is a fallback,
+    not a guess about any particular schema — it just needs to be a string long
+    enough to be unlikely to collide.
+    """
+    vals = []
+    for path in (ldef.get("anchors") or []):
+        v = get_path(record, path)
+        if v is not None and len(str(v).strip()) >= 4:
+            vals.append(str(v).strip())
+    if addressee_name:
+        vals.append(addressee_name)
+    if not vals and isinstance(addressee_block, dict):
+        scalars = [str(v).strip() for v in addressee_block.values()
+                   if isinstance(v, (str, int, float)) and len(str(v).strip()) >= 6]
+        if scalars:
+            vals.append(max(scalars, key=len))
+    return vals
+
+
 def plan_letters(spec: dict, record: dict) -> list:
     """Which letters this record should produce, per the BRD's generation rules.
 
@@ -244,6 +303,7 @@ def plan_letters(spec: dict, record: dict) -> list:
         blk, bp = resolve_block(letter["addressee"], record, letter)
         letter["addressee_name"] = block_name(blk, (spec.get("defaults") or {}).get("org_switch"))
         letter["addressee_path"] = bp
+        letter["anchor_values"] = _anchor_values(ldef, record, blk, letter["addressee_name"])
         out.append(letter)
     return out
 
@@ -266,8 +326,10 @@ def slot_checks(slot: dict, record: dict, letter: dict, spec: dict) -> list:
     """
     expected, why = eval_expected(slot, record, letter)
     name = slot.get("slot_name", slot.get("slot_id", "?"))
+    unresolved = [] if expected == ABSENT else missing_paths(slot, record, letter)
     if expected == ABSENT or not slot.get("expand", True):
-        return [{"label": name, "expected": expected, "why": why, "kind": "single"}]
+        return [{"label": name, "expected": expected, "why": why, "kind": "single",
+                 "unresolved": unresolved}]
 
     exp = slot.get("expected") or {}
     kind = exp.get("kind", "fields")
@@ -287,7 +349,8 @@ def slot_checks(slot: dict, record: dict, letter: dict, spec: dict) -> list:
     elif kind == "fields" and len(exp.get("fields") or []) > 1:
         fields = list(exp.get("fields") or [])
     else:
-        return [{"label": name, "expected": expected, "why": why, "kind": "single"}]
+        return [{"label": name, "expected": expected, "why": why, "kind": "single",
+                 "unresolved": unresolved}]
 
     for f in fields:
         raw = get_path(block, f)
@@ -298,7 +361,8 @@ def slot_checks(slot: dict, record: dict, letter: dict, spec: dict) -> list:
                       "why": f"From {bpath}/{f}".replace("//", "/"), "kind": "component"})
 
     if not comps:
-        return [{"label": name, "expected": expected, "why": why, "kind": "single"}]
+        return [{"label": name, "expected": expected, "why": why, "kind": "single",
+                 "unresolved": unresolved}]
     comps.append({"label": f"{name} (assembled)", "expected": expected,
                   "why": why + " — full value, checks ordering and truncation",
                   "kind": "assembled"})
