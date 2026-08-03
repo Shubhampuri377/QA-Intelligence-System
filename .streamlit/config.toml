@@ -1,0 +1,16 @@
+# Keep these in sync with the :root block in styles/theme.py — this file paints
+# Streamlit's own widget chrome (toggles, sliders, inputs, dataframes), which CSS
+# cannot always reach. If the two drift, native widgets show the old palette
+# while everything around them shows the new one.
+[theme]
+base = "light"
+
+primaryColor = "#1F3A5F"                  # Navy — same ramp as the generated documents
+backgroundColor = "#F7F8FA"               # Cool porcelain
+secondaryBackgroundColor = "#F1F3F7"      # Widget / card surface
+textColor = "#131720"                     # Rich ink
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"
+showSidebarNavigation = false

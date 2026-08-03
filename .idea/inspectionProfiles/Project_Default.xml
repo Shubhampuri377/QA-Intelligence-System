@@ -1,0 +1,34 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <list>
+          <option value="torch" />
+          <option value="transformers" />
+          <option value="sentence-transformers" />
+          <option value="langchain" />
+          <option value="langchain_huggingface" />
+          <option value="langchain_chroma" />
+          <option value="langchain_core" />
+          <option value="langchain_experimental" />
+          <option value="chromadb" />
+          <option value="huggingface_hub" />
+          <option value="opencv_python" />
+          <option value="pandas" />
+          <option value="numpy" />
+          <option value="pdf2image" />
+          <option value="PyPDF2" />
+          <option value="python-docx" />
+          <option value="pytesseract" />
+          <option value="openpyxl" />
+          <option value="fsspec" />
+          <option value="bitsandbytes" />
+          <option value="peft" />
+          <option value="trl" />
+          <option value="tqdm" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>

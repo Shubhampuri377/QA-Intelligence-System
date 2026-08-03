@@ -1,0 +1,15 @@
+streamlit>=1.38
+pandas
+PyMuPDF
+pdfplumber
+pypdf
+PyPDF2
+pytesseract
+pdf2image
+Pillow
+python-docx
+openpyxl
+reportlab
+anthropic
+openai
+google-genai
