@@ -151,6 +151,17 @@ def _shape_probe(expected: str, out: str, fmt: str, others=(), slot_name: str = 
     if not cands:
         return None
 
+    # The label is a TIEBREAKER, not a gate. With a single candidate there is
+    # nothing to disambiguate and quoting it is both safe and the most useful
+    # thing to report — requiring a label anchor even then cost two real catches
+    # on the WoodmenLife run ("Amount applied" expects $15.00, the letter prints
+    # $50.00, and the words "Amount applied" appear nowhere near it), turning a
+    # defect into "NOT CHECKED". The anchor earns its place only when several
+    # same-shape values compete, which is where the wrong one used to be picked.
+    if len(cands) == 1:
+        m = cands[0]
+        return {"found": m.group().strip(), "snippet": _snippet(out, m.start(), m.end())}
+
     anchor = _label_span(out, slot_name)
     if anchor is not None:
         near = [m for m in cands if 0 <= m.start() - anchor <= 60]
